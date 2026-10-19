@@ -1,19 +1,77 @@
 # AKS Capacity Toolkit
 
-Generic Terraform, Kubernetes, and PowerShell examples for exploring AKS capacity fallback in a non-production environment.
+This non-production lab tests the AKS Virtual Machine (VM) node pools feature as a way to mitigate temporary Azure capacity shortages. It is inspired by the AKS product group's article, [Navigating Capacity Challenges on AKS with Node Auto Provisioning or Virtual Machine Node Pools | AKS Engineering Blog](https://blog.aks.azure.com/2025/12/06/node-auto-provisioning-capacity-management). This lab explores the VM node pools approach, not Node Auto Provisioning (NAP).
 
-First deploy the baseline example environment: Terraform creates the resource group, AKS, and the original pools with default autoscaler settings, and the baseline Kubernetes manifest pins Hello World to the F8s_v2 application pool. Verify the running application before changing the architecture. On that existing cluster, enable the priority expander through CLI, apply its priority ConfigMap, create a mixed-SKU fallback pool, and finally update the Deployment to permit both application pools. There is no application repository to clone, image to build, or registry to create.
+The lab has two stages:
 
-## Publication and data handling
+1. **Reproduce a common customer starting point.** Deploy an AKS cluster with a Hello World application running on a Virtual Machine Scale Sets (VMSS) User node pool using `Standard_F8s_v2`. Terraform creates the resource group, cluster, and original pools with default autoscaler settings; the baseline Kubernetes manifest pins the application to that User pool. Verify that the application is running before changing the architecture.
+2. **Add a capacity fallback to the existing cluster.** Create an additional VM-based User node pool (`VirtualMachines` type) that supports multiple VM SKUs: `Standard_D8s_v5` and `Standard_D8s_v6`. Enable the cluster autoscaler's priority expander, apply its priority ConfigMap, and update the application's scheduling rules to allow both pools while preferring the original VMSS pool. The fallback pool starts at zero nodes and is intended to provide alternative SKUs during temporary capacity shortages, rather than serve as the normal application pool.
 
-This repository contains reusable example source only, not deployment records or evidence from a live environment. Resource names are illustrative; repeated-digit UUIDs and the `203.0.113.10` address in mocked tests are synthetic fixtures. The `0.0.0.0/0` test input verifies that unrestricted API access is rejected.
+The goal is to test capacity resilience without replacing the original pool or enabling NAP. Fallback is not a capacity guarantee: a zero-node pool does not reserve Azure capacity, and fallback nodes may remain in use until normal autoscaler scale-down and workload scheduling allow their removal.
 
-- Supply your own values locally using [terraform.tfvars.example](./terraform.tfvars.example). Never commit actual subscription, tenant, group, or user identifiers, operator IP addresses, credentials, or private endpoints.
-- Keep Terraform state, state backups, saved plans, provider caches, kubeconfigs, Azure CLI profiles, environment files, editor notes, logs, and fallback recovery JSON out of Git. Common paths are covered by [.gitignore](./.gitignore); custom filenames still require review.
-- Recovery JSON and command output can contain environment identifiers, node names, IP addresses, and local paths even when they contain no credentials. Review and redact them before sharing.
-- Review every staged file and commit's author email before publishing. Ignore rules do not remove files already tracked by Git, and deleting a file does not remove it from existing history.
+The repository provides Terraform, Kubernetes, and PowerShell examples for the full exercise. There is no application repository to clone, image to build, or registry to create.
 
 Only mocked/offline checks are intended for local validation without Azure access. Live deployment and the fallback exercise are opt-in operations that can create billable resources; verify current regional, provider, image, and CLI extension availability before use.
+
+## Technical concepts used in this lab
+
+### Why enable the priority expander?
+
+The AKS cluster autoscaler adds nodes when pods cannot be scheduled onto existing nodes. When more than one node pool could satisfy those pods, an **expander** determines which scale-up option to prefer. Adding a fallback pool alone does not tell the autoscaler to favor the original pool.
+
+This lab enables the **priority expander** so that `appf8` is preferred over `appfb` when both are eligible scale-up options. If the primary pool cannot grow, for example because it has reached its configured limit or provisioning has failed, the autoscaler can consider fallback capacity. Allocation failures involve retries, timeouts, and backoff; this is not an immediate or guaranteed failover mechanism. The autoscaler responds to unschedulable pods, not directly to HTTP traffic.
+
+### Why use a ConfigMap for priorities?
+
+Enabling `--expander priority` selects the autoscaler's decision strategy; it does not define the preferred pools. The strategy reads its rules from a ConfigMap named `cluster-autoscaler-priority-expander` in the `kube-system` namespace.
+
+The [priority ConfigMap](./k8s/vm-node-pools/cluster-autoscaler-priority-expander.yaml) maps numeric priorities to regular expressions matching autoscaler node-group names:
+
+| Priority | Name pattern | Purpose |
+| --- | --- | --- |
+| `50` | `.*appf8.*` | Prefer scaling the original application pool |
+| `10` | `.*appfb.*` | Use the fallback pool as a lower-priority scale-up option |
+
+**Higher numbers mean higher priority.** These rules express a preference between the primary and fallback pools; they do not define an order between the two fallback SKUs. Both enabling the expander and applying its ConfigMap are required to implement this policy. See the [AKS cluster autoscaler overview](https://learn.microsoft.com/en-us/azure/aks/cluster-autoscaler-overview) for background.
+
+### Why use a VM node pool for multiple SKUs?
+
+The original `VirtualMachineScaleSets` (VMSS) application pool uses one configured VM SKU, `Standard_F8s_v2`. To offer multiple SKUs **within one AKS node pool**, this lab adds a `VirtualMachines` pool instead of another single-SKU VMSS pool.
+
+A VM node pool supports multiple compatible, same-family VM SKUs through scale profiles, with up to five profiles per pool. Here, `appfb` has one autoscale profile for `Standard_D8s_v5` and another for `Standard_D8s_v6`, each with a minimum of 0 and a maximum of 3 nodes. This gives the autoscaler alternative capacity options without requiring a separate AKS pool for each SKU. The two profiles can grow to six nodes in total; they do not reserve either SKU.
+
+This is an AKS-managed node pool, not a collection of VMs managed independently of AKS. The existing VMSS pool stays in place, and the cluster continues using the standard cluster autoscaler rather than NAP. See [VirtualMachines mixed-SKU node pools](https://learn.microsoft.com/en-us/azure/aks/virtual-machines-node-pools) for compatibility requirements and limitations.
+
+### How do pod scheduling rules allow fallback?
+
+Autoscaler priorities control **which pool to grow**. Kubernetes node affinity controls **where pods may run**. The baseline application is pinned to `appf8`; leaving that hard restriction in place would prevent `appfb` from helping it.
+
+In section 8, the [target application manifest](./k8s/vm-node-pools/hello-world.yaml) allows both `appf8` and `appfb`, while retaining a soft preference for `appf8`. The `system` pool remains dedicated to critical addons. Ready fallback nodes can still receive pods even when the primary pool could grow, and neither soft affinity nor expander priorities automatically move running pods back to primary.
+
+## Lab architecture
+
+The diagram shows the **target architecture after section 8**. Only `system` and `appf8` exist in the Terraform baseline; `appfb` is added to that existing cluster through Azure CLI.
+
+```mermaid
+flowchart TB
+    subgraph AKS["Azure Kubernetes Service - Sweden Central"]
+        direction TB
+        subgraph SYSTEM["system - System pool / VMSS"]
+            S["Standard_D4s_v5<br/>2 nodes<br/>Critical addons only"]
+        end
+        subgraph PRIMARY["appf8 - Original User pool / VMSS"]
+            P["Standard_F8s_v2<br/>Initially 1 node; autoscale 0-3<br/>Hello World preferred here"]
+        end
+        subgraph FALLBACK["appfb - Fallback User pool / VirtualMachines"]
+            F5["Standard_D8s_v5<br/>Autoscale profile: 0-3 nodes"]
+            F6["Standard_D8s_v6<br/>Autoscale profile: 0-3 nodes"]
+        end
+    end
+```
+
+`appfb` starts with zero nodes across both profiles. Its boxes represent configured SKU options, not pre-provisioned VMs. Scale-up preference is `appf8` (priority 50) before `appfb` (priority 10); Hello World is eligible for either User pool after section 8.
+
+An [editable draw.io version](./docs/diagrams/aks-node-pools.drawio) is also provided.
 
 ## Walkthrough order
 
@@ -21,7 +79,7 @@ Only mocked/offline checks are intended for local validation without Azure acces
 2. **Change the existing cluster (section 8):** check prerequisites, enable the priority expander, apply its ConfigMap, create/verify `appfb`, and apply `k8s/vm-node-pools/hello-world.yaml` to update the existing application.
 3. **Target-environment operations (sections 9-10):** scale to zero/restore and optionally exercise fallback.
 
-Terraform does not configure the priority expander. The CLI and target manifests implement the post-baseline changes. The table below describes the completed target architecture; the fallback rows do not exist during the baseline phase.
+All of section 8 is completed through CLI commands (Azure CLI and kubectl), because these changes are applied on top of the existing Terraform-deployed environment rather than through changes to Terraform. The table below describes the completed target architecture; the fallback rows do not exist during the baseline phase.
 
 | Component | Configuration |
 | --- | --- |
@@ -889,6 +947,15 @@ Remove-Item Env:\KUBECONFIG
 ```
 
 Retain the Terraform state until Azure resource deletion has succeeded. Verify the resource groups and associated resources are gone; failed deletion can leave billable resources.
+
+## Publication and data handling
+
+This repository contains reusable example source only, not deployment records or evidence from a live environment. Resource names are illustrative; repeated-digit UUIDs and the `203.0.113.10` address in mocked tests are synthetic fixtures. The `0.0.0.0/0` test input verifies that unrestricted API access is rejected.
+
+- Supply your own values locally using [terraform.tfvars.example](./terraform.tfvars.example). Never commit actual subscription, tenant, group, or user identifiers, operator IP addresses, credentials, or private endpoints.
+- Keep Terraform state, state backups, saved plans, provider caches, kubeconfigs, Azure CLI profiles, environment files, editor notes, logs, and fallback recovery JSON out of Git. Common paths are covered by [.gitignore](./.gitignore); custom filenames still require review.
+- Recovery JSON and command output can contain environment identifiers, node names, IP addresses, and local paths even when they contain no credentials. Review and redact them before sharing.
+- Review every staged file and commit's author email before publishing. Ignore rules do not remove files already tracked by Git, and deleting a file does not remove it from existing history.
 
 ## References
 
