@@ -75,6 +75,8 @@ An [editable draw.io version](./docs/diagrams/aks-node-pools.drawio) is also pro
 
 ## Walkthrough order
 
+**Shell: PowerShell.** All command examples in this walkthrough, including Azure CLI (`az`), `kubectl`, and Terraform commands, are written for PowerShell and should be run from the repository root. Variable syntax, backtick line continuations, and error checks are PowerShell-specific; do not copy these blocks directly into Bash or Azure Cloud Shell's Bash mode.
+
 1. **Baseline example environment (sections 1-7):** deploy Terraform, connect, deploy `k8s/baseline`, and verify primary-only placement and public HTTP.
 2. **Change the existing cluster (section 8):** check prerequisites, enable the priority expander, apply its ConfigMap, create/verify `appfb`, and apply `k8s/vm-node-pools/hello-world.yaml` to update the existing application.
 3. **Target-environment operations (sections 9-10):** scale to zero/restore and optionally exercise fallback.
