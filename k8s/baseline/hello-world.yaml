@@ -1,0 +1,157 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hello-world
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hello-world-content
+  namespace: hello-world
+data:
+  index.html: |
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Hello World on AKS</title>
+        <style>
+          body { font-family: system-ui, sans-serif; margin: 4rem auto; max-width: 48rem; padding: 0 1rem; }
+          h1 { color: #0078d4; }
+        </style>
+      </head>
+      <body>
+        <h1>Hello World!</h1>
+        <p>Running on Azure Kubernetes Service in Sweden Central.</p>
+        <p>This application is scheduled on a Standard_F8s_v2 user node pool.</p>
+      </body>
+    </html>
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hello-world-nginx
+  namespace: hello-world
+data:
+  nginx.conf: |
+    worker_processes auto;
+    pid /tmp/nginx.pid;
+    error_log /dev/stderr warn;
+    events {
+      worker_connections 1024;
+    }
+    http {
+      include /etc/nginx/mime.types;
+      default_type application/octet-stream;
+      access_log /dev/stdout;
+      server_tokens off;
+      client_body_temp_path /tmp/client_temp;
+      proxy_temp_path /tmp/proxy_temp;
+      fastcgi_temp_path /tmp/fastcgi_temp;
+      uwsgi_temp_path /tmp/uwsgi_temp;
+      scgi_temp_path /tmp/scgi_temp;
+      server {
+        listen 8080;
+        root /usr/share/nginx/html;
+        index index.html;
+        location / {
+          try_files $uri $uri/ =404;
+        }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-world
+  namespace: hello-world
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hello-world
+  template:
+    metadata:
+      labels:
+        app: hello-world
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.azure.com/agentpool: appf8
+        workload: hello-world
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: nginx
+          image: nginx:1.30.2-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["nginx"]
+          args: ["-g", "daemon off;"]
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - name: content
+              mountPath: /usr/share/nginx/html
+              readOnly: true
+            - name: nginx-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+            - name: temporary
+              mountPath: /tmp
+      volumes:
+        - name: content
+          configMap:
+            name: hello-world-content
+        - name: nginx-config
+          configMap:
+            name: hello-world-nginx
+        - name: temporary
+          emptyDir:
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello-world
+  namespace: hello-world
+spec:
+  type: LoadBalancer
+  selector:
+    app: hello-world
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

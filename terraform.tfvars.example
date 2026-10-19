@@ -1,0 +1,15 @@
+subscription_id                 = "<your-azure-subscription-uuid>"
+admin_group_object_ids          = ["<your-entra-administrator-group-object-uuid>"]
+api_server_authorized_ip_ranges = ["<your-public-egress-ip>/32"]
+
+resource_group_name = "rg-aks-hello-sweden"
+cluster_name        = "aks-hello-sweden"
+
+user_pool_scaling = {
+  min_count     = 0
+  max_count     = 3
+  initial_count = 1
+}
+
+# Optional: choose a supported GA version returned by az aks get-versions.
+# kubernetes_version = "major.minor.patch"
